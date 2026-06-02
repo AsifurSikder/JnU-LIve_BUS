@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/joho/godotenv v1.5.1
+	github.com/leanovate/gopter v0.2.11
 	github.com/lib/pq v1.10.9
 	github.com/university-bus-tracker/shared v0.0.0
 	golang.org/x/crypto v0.48.0

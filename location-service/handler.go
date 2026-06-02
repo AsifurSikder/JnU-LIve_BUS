@@ -3,90 +3,180 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/redis/go-redis/v9"
+	sharedredis "github.com/mdasifurrahmansikder/jnu-live-bus/shared/redis"
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-type LocationUpdate struct {
-	BusID     string  `json:"bus_id"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
-	DriverID  string  `json:"driver_id"`
-	RouteID   string  `json:"route_id"`
-	Speed     float64 `json:"speed"`
-	Timestamp string  `json:"timestamp"`
-}
-
 type Handler struct {
-	rdb *redis.Client
-	hub *Hub
+	redisClient *sharedredis.Client
+	pubsub      *sharedredis.PubSubManager
+	hub         *Hub
+	config      *Config
 }
 
-func NewHandler(rdb *redis.Client, hub *Hub) *Handler {
-	return &Handler{rdb: rdb, hub: hub}
+func NewHandler(redisClient *sharedredis.Client, pubsub *sharedredis.PubSubManager, hub *Hub, config *Config) *Handler {
+	return &Handler{
+		redisClient: redisClient,
+		pubsub:      pubsub,
+		hub:         hub,
+		config:      config,
+	}
 }
 
 func (h *Handler) UpdateLocation(c *gin.Context) {
 	var update LocationUpdate
 	if err := c.ShouldBindJSON(&update); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if update.BusID == "" || update.Latitude == 0 || update.Longitude == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "bus_id, latitude, longitude required"})
+		respondError(c, http.StatusUnprocessableEntity, "validation_error", err.Error())
 		return
 	}
 
-	update.Timestamp = time.Now().Format(time.RFC3339)
-
-	data, _ := json.Marshal(update)
-	ctx := context.Background()
-
-	// Store in Redis, expires after 2 minutes (bus went offline)
-	if err := h.rdb.Set(ctx, "bus:location:"+update.BusID, data, 2*time.Minute).Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save"})
+	// Validate GPS payload
+	if err := ValidateGPSPayload(&update, h.config.MaxTimestampAge); err != nil {
+		respondError(c, http.StatusUnprocessableEntity, "validation_error", err.Error())
 		return
 	}
 
-	// Broadcast to all connected rider apps instantly
-	msg, _ := json.Marshal(gin.H{"type": "location_update", "data": update})
-	h.hub.Broadcast(msg)
+	// Check rate limit
+	rateLimitKey := fmt.Sprintf("ratelimit:driver:%s", update.BusID)
+	exists, err := h.redisClient.Exists(c.Request.Context(), rateLimitKey)
+	if err != nil {
+		log.Printf("Rate limit check error: %v", err)
+	} else if exists > 0 {
+		respondError(c, http.StatusTooManyRequests, "rate_limit_exceeded", 
+			fmt.Sprintf("Updates must be at least %v apart", h.config.MinUpdateInterval))
+		return
+	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "bus_id": update.BusID})
+	// Set rate limit
+	if err := h.redisClient.Set(c.Request.Context(), rateLimitKey, time.Now().Unix(), h.config.MinUpdateInterval); err != nil {
+		log.Printf("Failed to set rate limit: %v", err)
+	}
+
+	// Store location in Redis with hash
+	locationKey := fmt.Sprintf("bus:location:%s", update.BusID)
+	fields := []interface{}{
+		"latitude", update.Latitude,
+		"longitude", update.Longitude,
+		"timestamp", update.Timestamp,
+	}
+	if update.RouteID != "" {
+		fields = append(fields, "routeId", update.RouteID)
+	}
+	if update.RouteName != "" {
+		fields = append(fields, "routeName", update.RouteName)
+	}
+	if update.DriverID != "" {
+		fields = append(fields, "driverId", update.DriverID)
+	}
+	if update.DriverName != "" {
+		fields = append(fields, "driverName", update.DriverName)
+	}
+	if update.Speed > 0 {
+		fields = append(fields, "speed", fmt.Sprintf("%.2f", update.Speed))
+	}
+	if update.Accuracy > 0 {
+		fields = append(fields, "accuracy", fmt.Sprintf("%.2f", update.Accuracy))
+	}
+
+	if err := h.redisClient.HSet(c.Request.Context(), locationKey, fields...); err != nil {
+		respondError(c, http.StatusInternalServerError, "database_error", "Failed to store location")
+		return
+	}
+
+	// Set TTL on location
+	if err := h.redisClient.Expire(c.Request.Context(), locationKey, h.config.LocationTTL); err != nil {
+		log.Printf("Failed to set TTL: %v", err)
+	}
+
+	// Add bus to active set
+	if err := h.redisClient.SAdd(c.Request.Context(), "buses:active", update.BusID); err != nil {
+		log.Printf("Failed to add bus to active set: %v", err)
+	}
+
+	// Publish to Redis pub/sub channel
+	if err := h.pubsub.Publish(c.Request.Context(), "bus:location:updates", update); err != nil {
+		log.Printf("Failed to publish location update: %v", err)
+	}
+
+	// Broadcast to WebSocket clients
+	broadcastMsg := BroadcastMessage{
+		Type:       "location_update",
+		BusID:      update.BusID,
+		RouteID:    update.RouteID,
+		RouteName:  update.RouteName,
+		Latitude:   update.Latitude,
+		Longitude:  update.Longitude,
+		Timestamp:  update.Timestamp,
+		DriverName: update.DriverName,
+	}
+	msgData, _ := json.Marshal(broadcastMsg)
+	h.hub.Broadcast(msgData)
+
+	// Count broadcasted clients
+	broadcastCount := h.hub.ClientCount()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":        "accepted",
+		"broadcastedTo": broadcastCount,
+	})
 }
 
 func (h *Handler) GetAllBuses(c *gin.Context) {
-	ctx := context.Background()
-	keys, err := h.rdb.Keys(ctx, "bus:location:*").Result()
+	ctx := c.Request.Context()
+
+	// Get active buses
+	busIDs, err := h.redisClient.SMembers(ctx, "buses:active")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch"})
+		respondError(c, http.StatusInternalServerError, "database_error", "Failed to fetch buses")
 		return
 	}
 
-	buses := []LocationUpdate{}
-	for _, key := range keys {
-		data, err := h.rdb.Get(ctx, key).Result()
-		if err != nil {
+	buses := make([]LocationUpdate, 0, len(busIDs))
+	for _, busID := range busIDs {
+		locationKey := fmt.Sprintf("bus:location:%s", busID)
+		data, err := h.redisClient.HGetAll(ctx, locationKey)
+		if err != nil || len(data) == 0 {
 			continue
 		}
-		var loc LocationUpdate
-		if json.Unmarshal([]byte(data), &loc) == nil {
-			buses = append(buses, loc)
+
+		update := LocationUpdate{
+			BusID:      busID,
+			Latitude:   parseFloat(data["latitude"]),
+			Longitude:  parseFloat(data["longitude"]),
+			Timestamp:  data["timestamp"],
+			RouteID:    data["routeId"],
+			RouteName:  data["routeName"],
+			DriverID:   data["driverId"],
+			DriverName: data["driverName"],
+			Speed:      parseFloat(data["speed"]),
+			Accuracy:   parseFloat(data["accuracy"]),
 		}
+
+		buses = append(buses, update)
 	}
+
 	c.JSON(http.StatusOK, gin.H{"buses": buses, "count": len(buses)})
 }
 
 func (h *Handler) WebSocketHandler(c *gin.Context) {
+	// Check connection limit
+	if h.hub.ClientCount() >= h.config.MaxRiderConnections {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Maximum number of connections reached",
+		})
+		return
+	}
+
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade error: %v", err)
@@ -94,18 +184,35 @@ func (h *Handler) WebSocketHandler(c *gin.Context) {
 	}
 
 	client := &Client{conn: conn, send: make(chan []byte, 256)}
-	h.hub.register <- client
+	h.hub.Register(client)
 
 	// Send current bus positions immediately on connect
 	ctx := context.Background()
-	if keys, err := h.rdb.Keys(ctx, "bus:location:*").Result(); err == nil {
-		for _, key := range keys {
-			if data, err := h.rdb.Get(ctx, key).Result(); err == nil {
-				var loc LocationUpdate
-				if json.Unmarshal([]byte(data), &loc) == nil {
-					msg, _ := json.Marshal(gin.H{"type": "location_update", "data": loc})
-					client.send <- msg
-				}
+	busIDs, err := h.redisClient.SMembers(ctx, "buses:active")
+	if err == nil {
+		for _, busID := range busIDs {
+			locationKey := fmt.Sprintf("bus:location:%s", busID)
+			data, err := h.redisClient.HGetAll(ctx, locationKey)
+			if err != nil || len(data) == 0 {
+				continue
+			}
+
+			broadcastMsg := BroadcastMessage{
+				Type:       "location_update",
+				BusID:      busID,
+				RouteID:    data["routeId"],
+				RouteName:  data["routeName"],
+				Latitude:   parseFloat(data["latitude"]),
+				Longitude:  parseFloat(data["longitude"]),
+				Timestamp:  data["timestamp"],
+				DriverName: data["driverName"],
+			}
+
+			msgData, _ := json.Marshal(broadcastMsg)
+			select {
+			case client.send <- msgData:
+			default:
+				// Channel full, skip
 			}
 		}
 	}
@@ -113,12 +220,27 @@ func (h *Handler) WebSocketHandler(c *gin.Context) {
 	// Write pump: sends messages from channel to WebSocket
 	go func() {
 		defer func() {
-			h.hub.unregister <- client
+			h.hub.Unregister(client)
 			conn.Close()
 		}()
-		for msg := range client.send {
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				break
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case msg, ok := <-client.send:
+				if !ok {
+					conn.WriteMessage(websocket.CloseMessage, []byte{})
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+					return
+				}
+			case <-ticker.C:
+				// Send ping to keep connection alive
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -126,8 +248,24 @@ func (h *Handler) WebSocketHandler(c *gin.Context) {
 	// Read pump: keeps connection alive, detects disconnect
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
-			h.hub.unregister <- client
+			h.hub.Unregister(client)
 			break
 		}
 	}
+}
+
+func respondError(c *gin.Context, status int, code, message string) {
+	c.JSON(status, ErrorResponse{
+		Error: ErrorDetail{
+			Code:      code,
+			Message:   message,
+			Timestamp: time.Now(),
+		},
+	})
+}
+
+func parseFloat(s string) float64 {
+	var f float64
+	fmt.Sscanf(s, "%f", &f)
+	return f
 }

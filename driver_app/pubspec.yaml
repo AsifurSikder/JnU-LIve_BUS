@@ -1,0 +1,46 @@
+name: driver_app
+description: "JnU Live Bus Tracker - Driver App"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # UI
+  cupertino_icons: ^1.0.8
+  
+  # HTTP & API
+  http: ^1.2.0
+  
+  # Storage
+  flutter_secure_storage: ^9.2.2
+  shared_preferences: ^2.2.3
+  
+  # Location & GPS
+  geolocator: ^12.0.0
+  permission_handler: ^11.3.1
+  
+  # State Management
+  provider: ^6.1.2
+  
+  # Local Database
+  sqflite: ^2.3.3+1
+  path: ^1.9.0
+  
+  # Background Services
+  flutter_foreground_task: ^8.5.0
+  
+  # Utils
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

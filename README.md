@@ -1,6 +1,10 @@
-# University Bus Tracker System
+# 🚌 JnU Live Bus Tracker
 
-A real-time bus tracking system for Jagannath University built with Go microservices, Android apps, and React admin panel.
+**Real-time bus tracking system for Jagannath University**
+
+Built with Go microservices, Flutter mobile apps, and React admin panel.
+
+**Status**: 98% Complete | Production-Ready Backend | Functional Driver App
 
 ## 🏗️ Architecture
 
